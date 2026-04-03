@@ -2,19 +2,20 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:async';
-import 'dart:math' as math;
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
 
-// Add the following variables to store parsed data
-String voltage = "";
-String current = "";
-String currentLimit = "0";
-String currentLimitReceived = "0";
+// TODO: Replace 500ms polling with BLE notifications (setNotifyValue + onValueReceived)
+//       to reduce radio/battery usage and latency.
+// TODO: Reconcile isOutputOn (user intent) with outputEN (device-reported state) —
+//       currently the Switch can show a stale position if the device rejects a request.
+// TODO: Fix widget_test.dart — imports wrong package name and tests a counter app that doesn't exist.
 
+const String kDeviceName = "Spark Analyzer";
+const String kServiceUuid = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const String kCharacteristicUuid = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 
-bool outputEN = false;
 void main() {
   runApp(MyApp());
 }
@@ -33,10 +34,16 @@ class ScanPage extends StatefulWidget {
   _ScanPageState createState() => _ScanPageState();
 }
 
-
 class _ScanPageState extends State<ScanPage> {
   List<BluetoothDevice> devices = [];
   bool isScanning = false;
+  StreamSubscription? _scanSubscription;
+
+  @override
+  void dispose() {
+    _scanSubscription?.cancel();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -47,22 +54,23 @@ class _ScanPageState extends State<ScanPage> {
       body: Column(
         children: [
           Padding(
-            padding: const EdgeInsets.all(8.0), // Adds padding around the button
+            padding: const EdgeInsets.all(8.0),
             child: ElevatedButton(
               style: ElevatedButton.styleFrom(
-                padding: EdgeInsets.symmetric(horizontal: 30, vertical: 15), // Adjust the padding
-                textStyle: TextStyle(fontSize: 20), // Set text style here
+                padding: EdgeInsets.symmetric(horizontal: 30, vertical: 15),
+                textStyle: TextStyle(fontSize: 20),
                 shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(8), // Optional: add rounded corners
+                  borderRadius: BorderRadius.circular(8),
                 ),
               ),
               child: Text('Start Scanning'),
               onPressed: () async {
                 setState(() {
-                  isScanning = true; // <-- Start scanning
+                  isScanning = true;
                 });
                 devices = [];
-                FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
+                _scanSubscription?.cancel();
+                _scanSubscription = FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
                   for (ScanResult result in results) {
                     var device = result.device;
                     if (!devices.contains(device)) {
@@ -75,26 +83,27 @@ class _ScanPageState extends State<ScanPage> {
                 await FlutterBluePlus.startScan(timeout: Duration(seconds: 4));
                 await FlutterBluePlus.stopScan();
                 setState(() {
-                  isScanning = false; // <-- Stop scanning
+                  isScanning = false;
                 });
               },
             ),
           ),
-          if (isScanning) // <-- Display loading wheel if scanning
+          if (isScanning)
             CircularProgressIndicator(),
           Expanded(
             child: ListView.builder(
               itemCount: devices.length,
               itemBuilder: (context, index) {
-                bool isSparkAnalyzer = devices[index].platformName == "Spark Analyzer";
+                bool isSparkAnalyzer = devices[index].platformName == kDeviceName;
 
                 return ListTile(
                   title: Text(devices[index].platformName.isEmpty ? "(unknown device)" : devices[index].platformName),
-                  trailing: isSparkAnalyzer 
+                  trailing: isSparkAnalyzer
                     ? ElevatedButton(
                         child: Text('Connect'),
                         onPressed: () async {
                           await devices[index].connect();
+                          if (!mounted) return;
                           Navigator.push(
                             context,
                             MaterialPageRoute(
@@ -103,7 +112,7 @@ class _ScanPageState extends State<ScanPage> {
                           );
                         },
                       )
-                    : null, // No button for non-Spark Analyzer devices
+                    : null,
                   tileColor: isSparkAnalyzer ? Colors.white : Colors.grey[300],
                 );
               },
@@ -113,10 +122,7 @@ class _ScanPageState extends State<ScanPage> {
       ),
     );
   }
-
-
 }
-
 
 class ControlPage extends StatefulWidget {
   final BluetoothDevice device;
@@ -131,325 +137,312 @@ class _ControlPageState extends State<ControlPage> {
   bool isOutputOn = false;
   String selectedVoltage = "5";
   BluetoothCharacteristic? targetCharacteristic;
-  String receivedData = "No data received.";
   StreamSubscription? deviceConnection;
   String? chosenDirectoryPath;
   Timer? _pollingTimer;
   bool _isLogging = false;
-  bool isSendingData = false;
+  bool _isSendingData = false;
+  bool _isReading = false;
 
- @override
-void initState() {
-  super.initState();
-  discoverServices();
+  String voltage = "";
+  String current = "";
+  String currentLimit = "0";
+  String currentLimitReceived = "0";
+  bool outputEN = false;
 
-  // Listen to device connection state changes
-  deviceConnection = widget.device.connectionState.listen((state) {
-    if (state == BluetoothConnectionState.disconnected) {
-      // Device got disconnected. Go back to scan page.
-      Navigator.of(context).pop(); // pop current page from stack
-      // Optionally disconnect from the device (to ensure clean disconnection)
-      widget.device.disconnect();
-    }
-  });
-    // Start a timer to read the characteristic value every 2 seconds TODO
+  @override
+  void initState() {
+    super.initState();
+    discoverServices();
+
+    deviceConnection = widget.device.connectionState.listen((state) {
+      if (state == BluetoothConnectionState.disconnected) {
+        Navigator.of(context).pop();
+        widget.device.disconnect();
+      }
+    });
+
     _pollingTimer = Timer.periodic(Duration(milliseconds: 500), (timer) {
       if (targetCharacteristic != null) {
         readBluetoothData();
       }
     });
   }
-@override
-void dispose() {
-  // Dispose the device connection listener
-  deviceConnection?.cancel();
-    // Dispose the timer when the widget is disposed to avoid memory leaks
+
+  @override
+  void dispose() {
+    deviceConnection?.cancel();
     _pollingTimer?.cancel();
     super.dispose();
   }
 
-discoverServices() async {
-  List<BluetoothService> services = await widget.device.discoverServices();
-  services.forEach((service) {
-    if (service.uuid.toString() == "4fafc201-1fb5-459e-8fcc-c5c9c331914b") {
-      service.characteristics.forEach((characteristic) {
-        if (characteristic.uuid.toString() == "beb5483e-36e1-4688-b7f5-ea07361b26a8") {
-          targetCharacteristic = characteristic;
+  Future<void> discoverServices() async {
+    try {
+      List<BluetoothService> services = await widget.device.discoverServices();
+      for (var service in services) {
+        if (service.uuid.toString() == kServiceUuid) {
+          for (var characteristic in service.characteristics) {
+            if (characteristic.uuid.toString() == kCharacteristicUuid) {
+              targetCharacteristic = characteristic;
+            }
+          }
         }
+      }
+    } catch (e) {
+      print('Error discovering services: $e');
+    }
+  }
+
+  void logDataToFile(Map<String, dynamic> parsedData) async {
+    if (!_isLogging) return;
+
+    try {
+      String directoryPath = chosenDirectoryPath ?? (await getApplicationDocumentsDirectory()).path;
+      final file = File('$directoryPath/spark_analyzer_log.csv');
+
+      if (!await file.exists()) {
+        await file.writeAsString("Timestamp,Voltage,Current,OutputEN,CurrentLimit\n");
+      }
+
+      String csvData = [
+        DateTime.now().toIso8601String(),
+        parsedData['Voltage'].toString(),
+        parsedData['Current'].toString(),
+        parsedData['OutputEN'] == true ? "Enabled" : "Disabled",
+        parsedData['currentLimit'].toString(),
+      ].join(",") + "\n";
+
+      await file.writeAsString(csvData, mode: FileMode.append);
+    } catch (e) {
+      print('Error logging data: $e');
+    }
+  }
+
+  Future<void> sendBluetoothData() async {
+    if (targetCharacteristic == null || _isSendingData) return;
+
+    _isSendingData = true;
+
+    try {
+      Map<String, dynamic> dataToSend = {
+        'output': isOutputOn,
+        'voltage': selectedVoltage,
+        'currentLimit': currentLimit
+      };
+      String jsonData = jsonEncode(dataToSend);
+      final List<int> data = utf8.encode(jsonData);
+
+      await targetCharacteristic!.write(data, withoutResponse: false);
+    } catch (e) {
+      print('Error sending data: $e');
+    } finally {
+      _isSendingData = false;
+    }
+  }
+
+  Future<void> readBluetoothData() async {
+    if (targetCharacteristic == null || _isReading) return;
+
+    _isReading = true;
+    try {
+      List<int> value = await targetCharacteristic!.read();
+
+      if (value.isEmpty) return;
+
+      String decodedValue = utf8.decode(value);
+      Map<String, dynamic> parsedData = jsonDecode(decodedValue);
+
+      bool isValidData = parsedData.containsKey('Voltage') &&
+                          parsedData.containsKey('Current') &&
+                          parsedData.containsKey('OutputEN') &&
+                          parsedData.containsKey('currentLimit');
+      if (!isValidData) {
+        print('Incomplete data packet received, ignoring.');
+        return;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        voltage = (parsedData['Voltage'] ?? '').toString();
+        current = (parsedData['Current'] ?? '').toString();
+        outputEN = parsedData['OutputEN'] ?? false;
+        currentLimitReceived = (parsedData['currentLimit'] ?? '0').toString();
       });
+
+      logDataToFile(parsedData);
+    } catch (e) {
+      print('Error reading data: $e');
+    } finally {
+      _isReading = false;
     }
-  });
-
-}
-
-void logDataToFile(String data) async {
-  if (_isLogging) {  // Check if logging is enabled
-    String directoryPath = chosenDirectoryPath ?? (await getApplicationDocumentsDirectory()).path;
-    final file = File('$directoryPath/spark_analyzer_log.csv');
-    
-    // Ensure the file exists and has a CSV header if it's new
-    bool fileExists = await file.exists();
-    if (!fileExists) {
-      await file.writeAsString("Timestamp,Voltage,Current,OutputEN\n");
-    }
-    
-    // Parse JSON data
-    Map<String, dynamic> parsedData = jsonDecode(data);
-    String csvData = [
-      DateTime.now().toIso8601String(), // Timestamp
-      parsedData['Voltage'].toString(), // Voltage
-      parsedData['Current'].toString(), // Current
-      parsedData['OutputEN'] ? "Enabled" : "Disabled", // Output Enable Status
-      parsedData['currentLimit'].toString(), // Current Limit
-    ].join(",") + "\n"; // Join with commas and append newline
-    
-    // Write the CSV data to the file
-    await file.writeAsString(csvData, mode: FileMode.append);
-  }
-}
-
-
-sendBluetoothData() async {
-  if (targetCharacteristic == null || isSendingData) {
-    print('Characteristic is not set or data is currently being sent.');
-    return;
   }
 
-  isSendingData = true; // Set flag to indicate sending is in progress
-
-  try {
-    Map<String, dynamic> dataToSend = {
-      'output': isOutputOn,
-      'voltage': selectedVoltage,
-      'currentLimit': currentLimit
-    };
-    String jsonData = jsonEncode(dataToSend);
-    final List<int> data = utf8.encode(jsonData);
-
-    await targetCharacteristic!.write(data, withoutResponse: false);
-    print('Data sent: $jsonData');
-  } catch (e) {
-    print('Error sending data: $e');
-  } finally {
-    isSendingData = false; // Clear flag regardless of the result
-  }
-}
-
-
-
-readBluetoothData() async {
-  if (targetCharacteristic == null) return;
-
-  List<int> value = await targetCharacteristic!.read();
-  print("Received raw data: $value");
-
-  if (value.isNotEmpty) {
-    String decodedValue = utf8.decode(value); // Convert the List<int> to a String
-
-    // Parse JSON
-    Map<String, dynamic> parsedData = jsonDecode(decodedValue);
-    // Check if all expected keys are present
-    bool isValidData = parsedData.containsKey('Voltage') &&
-                        parsedData.containsKey('Current') &&
-                        parsedData.containsKey('OutputEN') &&
-                        parsedData.containsKey('currentLimit');
-    // If any key is missing, consider the data packet as incomplete/invalid and ignore it
-    if (!isValidData) {
-      print('Incomplete data packet received, ignoring.');
-      return;
-    }
-    setState(() {
-      receivedData = decodedValue;
-      voltage = parsedData['Voltage'].toString() ?? "";
-      current = parsedData['Current'].toString() ?? "";
-      outputEN = parsedData['OutputEN'] ?? false;
-      currentLimitReceived = parsedData['currentLimit'].toString() ?? "0";  // Read the currentLimit from JSON
-
-      logDataToFile(decodedValue);
-
-    });
-  }
-}
-
-
-@override
-Widget build(BuildContext context) {
-  return Scaffold(
-    appBar: AppBar(
-      title: Text('Control Panel'),
-    ),
-    body: SingleChildScrollView( // 1. Use SingleChildScrollView
-      child: Center( // 3. Center the primary content
-        child: ConstrainedBox(
-          constraints: BoxConstraints(maxWidth: 600),  // This is to ensure that content doesn't spread too wide on tablets or wide screens
-          child: Padding( // 4. Add some padding
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                // Inside the Control section
-                Card(
-                  elevation: 5,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Text("Control", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                        SizedBox(height: 16),
-                        Row(
-                          children: [
-                            // Left column of Control
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text("Select Voltage:"),
-                                  DropdownButton<String>(
-                                    value: selectedVoltage,
-                                    items: ['5', '9', '12', '15', '20'].map((String value) {
-                                      return DropdownMenuItem<String>(
-                                        value: value,
-                                        child: Text(value),
-                                      );
-                                    }).toList(),
-                                    onChanged: (newValue) {
-                                      setState(() {
-                                        selectedVoltage = newValue!;
-                                      });
-                                    },
-                                  ),
-                                  SizedBox(height: 16),
-                                  Text("Toggle Output:"),
-                                  Switch(
-                                    value: isOutputOn,
-                                    onChanged: (value) {
-                                      setState(() {
-                                        isOutputOn = value;
-                                      });
-                                    },
-                                  ),
-                                ],
-                              ),
-                            ),
-                            // Right column of Control
-                            Expanded(
-                              child: Column(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  Text('Send to Spark Analyzer'),
-                                  SizedBox(height: 8), // Adds space between the text and the icon button
-                                  Container(
-                                    decoration: BoxDecoration(
-                                      color: Theme.of(context).primaryColor, // Default blue color
-                                      borderRadius: BorderRadius.circular(8), // Rounded corners
-                                    ),
-                                    child: IconButton(
-                                      iconSize: 24, // Adjust the icon size if needed
-                                      icon: Icon(Icons.send, color: Colors.white), // White icon for contrast
-                                      onPressed: () {
-                                        sendBluetoothData();
-                                      },
-                                      tooltip: 'Send to Spark Analyzer', // Tooltip text on long press
-                                    ),
-                                  ),
-                                  SizedBox(height: 16), // This maintains the spacing between elements
-                                  // Current Limit (mA) entry
-                                  Text("Current Limit (mA):"),
-                                  Container(
-                                    width: 100, // Fixed width for appearance
-                                    child: TextField(
-                                      keyboardType: TextInputType.number, // Only numbers
-                                      onChanged: (String value) {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Control Panel'),
+      ),
+      body: SingleChildScrollView(
+        child: Center(
+          child: ConstrainedBox(
+            constraints: BoxConstraints(maxWidth: 600),
+            child: Padding(
+              padding: const EdgeInsets.all(16.0),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Card(
+                    elevation: 5,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text("Control", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          SizedBox(height: 16),
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text("Select Voltage:"),
+                                    DropdownButton<String>(
+                                      value: selectedVoltage,
+                                      items: ['5', '9', '12', '15', '20'].map((String value) {
+                                        return DropdownMenuItem<String>(
+                                          value: value,
+                                          child: Text(value),
+                                        );
+                                      }).toList(),
+                                      onChanged: (newValue) {
                                         setState(() {
-                                          currentLimit = value;
+                                          selectedVoltage = newValue!;
                                         });
                                       },
-                                      decoration: InputDecoration(
-                                        hintText: "e.g., 1000",
-                                        border: OutlineInputBorder(),
+                                    ),
+                                    SizedBox(height: 16),
+                                    Text("Toggle Output:"),
+                                    Switch(
+                                      value: isOutputOn,
+                                      onChanged: (value) {
+                                        setState(() {
+                                          isOutputOn = value;
+                                        });
+                                      },
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              Expanded(
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text('Send to Spark Analyzer'),
+                                    SizedBox(height: 8),
+                                    Container(
+                                      decoration: BoxDecoration(
+                                        color: Theme.of(context).primaryColor,
+                                        borderRadius: BorderRadius.circular(8),
+                                      ),
+                                      child: IconButton(
+                                        iconSize: 24,
+                                        icon: Icon(Icons.send, color: Colors.white),
+                                        onPressed: () {
+                                          sendBluetoothData();
+                                        },
+                                        tooltip: 'Send to Spark Analyzer',
                                       ),
                                     ),
-                                  ),
-                                ],
+                                    SizedBox(height: 16),
+                                    Text("Current Limit (mA):"),
+                                    Container(
+                                      width: 100,
+                                      child: TextField(
+                                        keyboardType: TextInputType.number,
+                                        onChanged: (String value) {
+                                          setState(() {
+                                            currentLimit = value;
+                                          });
+                                        },
+                                        decoration: InputDecoration(
+                                          hintText: "e.g., 1000",
+                                          border: OutlineInputBorder(),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
                               ),
-                            ),
-                          ],
-                        ),
-                      ],
+                            ],
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-                SizedBox(height: 5),
-                // Inside the Spark Analyzer section
-                Card(
-                  elevation: 5,
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        Text("Data from Spark Analyzer", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-                        SizedBox(height: 16),
-                        Table(
-                          columnWidths: const {
-                            0: FlexColumnWidth(),
-                            1: FlexColumnWidth(),
-                          },
-                          border: TableBorder.all(),
-                          children: [
-                            TableRow(children: [
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text("Voltage")),
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text(voltage)),
-                            ]),
-                            TableRow(children: [
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text("Current")),
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text(current)),
-                            ]),
-                            TableRow(children: [
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text("Output EN")),
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text(outputEN ? "Enabled" : "Disabled")),
-                            ]),
-                            TableRow(children: [
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text("Current Limit Set")),
-                              Padding(padding: const EdgeInsets.all(8.0), child: Text(currentLimitReceived)),
-                            ]),
-                          ],
-                        ),
-                        SizedBox(height: 20),
-                        ElevatedButton(
-                            child: Text('Choose Save Directory'),
-                            onPressed: () async {
-                              String? directoryPath = await FilePicker.platform.getDirectoryPath();
-                              if (directoryPath != null) {
-                                  setState(() {
-                                      chosenDirectoryPath = directoryPath;
-                                  });
-                              }
+                  SizedBox(height: 5),
+                  Card(
+                    elevation: 5,
+                    child: Padding(
+                      padding: const EdgeInsets.all(16.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text("Data from Spark Analyzer", style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                          SizedBox(height: 16),
+                          Table(
+                            columnWidths: const {
+                              0: FlexColumnWidth(),
+                              1: FlexColumnWidth(),
                             },
-                        ),
-                        Text("Current Save Directory: ${chosenDirectoryPath ?? "Default App Directory"}"),
-                        // Added Logging button
-                        ElevatedButton(
-                          onPressed: () {
-                            setState(() {
-                              _isLogging = !_isLogging;  // Toggle logging state
-                            });
-                          },
-                          child: Text(_isLogging ? "Stop Logging" : "Start Logging"),
-                        ),
-                      ],
+                            border: TableBorder.all(),
+                            children: [
+                              _tableRow("Voltage", voltage),
+                              _tableRow("Current", current),
+                              _tableRow("Output EN", outputEN ? "Enabled" : "Disabled"),
+                              _tableRow("Current Limit Set", currentLimitReceived),
+                            ],
+                          ),
+                          SizedBox(height: 20),
+                          ElevatedButton(
+                              child: Text('Choose Save Directory'),
+                              onPressed: () async {
+                                String? directoryPath = await FilePicker.platform.getDirectoryPath();
+                                if (directoryPath != null) {
+                                    setState(() {
+                                        chosenDirectoryPath = directoryPath;
+                                    });
+                                }
+                              },
+                          ),
+                          Text("Current Save Directory: ${chosenDirectoryPath ?? "Default App Directory"}"),
+                          ElevatedButton(
+                            onPressed: () {
+                              setState(() {
+                                _isLogging = !_isLogging;
+                              });
+                            },
+                            child: Text(_isLogging ? "Stop Logging" : "Start Logging"),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
           ),
         ),
       ),
-    ),
-  );
-}
+    );
+  }
 
+  TableRow _tableRow(String label, String value) {
+    return TableRow(children: [
+      Padding(padding: const EdgeInsets.all(8.0), child: Text(label)),
+      Padding(padding: const EdgeInsets.all(8.0), child: Text(value)),
+    ]);
+  }
 }
