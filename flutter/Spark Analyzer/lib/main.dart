@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:flutter_blue/flutter_blue.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:io';
@@ -35,9 +35,8 @@ class ScanPage extends StatefulWidget {
 
 
 class _ScanPageState extends State<ScanPage> {
-  FlutterBlue flutterBlue = FlutterBlue.instance;
   List<BluetoothDevice> devices = [];
-  bool isScanning = false; 
+  bool isScanning = false;
 
   @override
   Widget build(BuildContext context) {
@@ -63,8 +62,7 @@ class _ScanPageState extends State<ScanPage> {
                   isScanning = true; // <-- Start scanning
                 });
                 devices = [];
-                await flutterBlue.startScan(timeout: Duration(seconds: 4));
-                flutterBlue.scanResults.listen((List<ScanResult> results) {
+                FlutterBluePlus.scanResults.listen((List<ScanResult> results) {
                   for (ScanResult result in results) {
                     var device = result.device;
                     if (!devices.contains(device)) {
@@ -74,7 +72,8 @@ class _ScanPageState extends State<ScanPage> {
                     }
                   }
                 });
-                await flutterBlue.stopScan();
+                await FlutterBluePlus.startScan(timeout: Duration(seconds: 4));
+                await FlutterBluePlus.stopScan();
                 setState(() {
                   isScanning = false; // <-- Stop scanning
                 });
@@ -87,10 +86,10 @@ class _ScanPageState extends State<ScanPage> {
             child: ListView.builder(
               itemCount: devices.length,
               itemBuilder: (context, index) {
-                bool isSparkAnalyzer = devices[index].name == "Spark Analyzer";
+                bool isSparkAnalyzer = devices[index].platformName == "Spark Analyzer";
 
                 return ListTile(
-                  title: Text(devices[index].name.isEmpty ? "(unknown device)" : devices[index].name),
+                  title: Text(devices[index].platformName.isEmpty ? "(unknown device)" : devices[index].platformName),
                   trailing: isSparkAnalyzer 
                     ? ElevatedButton(
                         child: Text('Connect'),
@@ -145,8 +144,8 @@ void initState() {
   discoverServices();
 
   // Listen to device connection state changes
-  deviceConnection = widget.device.state.listen((state) {
-    if (state == BluetoothDeviceState.disconnected) {
+  deviceConnection = widget.device.connectionState.listen((state) {
+    if (state == BluetoothConnectionState.disconnected) {
       // Device got disconnected. Go back to scan page.
       Navigator.of(context).pop(); // pop current page from stack
       // Optionally disconnect from the device (to ensure clean disconnection)
